@@ -1,0 +1,27 @@
+name: Build x64 Release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cs2-veh-dumper-x64
+          path: |
+            build/Release/dumper.exe
+            build/Release/veh_dumper.dll
+            build/Release/*.pdb
