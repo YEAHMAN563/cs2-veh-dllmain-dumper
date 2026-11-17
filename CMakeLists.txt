@@ -11,8 +11,8 @@ add_executable(dumper
 )
 target_include_directories(dumper PRIVATE src/dumper)
 if(MSVC)
-    target_compile_options(dumper PRIVATE /W3 /EHsc)
-    # Admin manifest
+    target_compile_options(dumper PRIVATE /W3 /EHsc /MT)
+    # Admin manifest via linker flag
     set_target_properties(dumper PROPERTIES LINK_FLAGS "/MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
 endif()
 
@@ -22,10 +22,11 @@ add_library(veh_dumper SHARED
 )
 target_include_directories(veh_dumper PRIVATE src/dll)
 if(MSVC)
-    target_compile_options(veh_dumper PRIVATE /W3 /EHsc)
+    target_compile_options(veh_dumper PRIVATE /W3 /EHsc /MT)
+    target_link_libraries(veh_dumper PRIVATE Psapi)
 endif()
 
-# Copy DLL next to EXE for convenience
+# Copy DLL next to EXE
 add_custom_command(TARGET veh_dumper POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:veh_dumper>

@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <winternl.h>
 #include <TlHelp32.h>
+#include <Psapi.h>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <filesystem>
 
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "Psapi.lib")
 
 // Marker that the host overwrites with the real dump root path
 char g_DumpRoot[MAX_PATH] = "DUMPROOT_PLACEHOLDER_XXXX";
@@ -27,10 +29,11 @@ static bool WriteBin(const fs::path& path, const void* data, size_t size) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     f.write((const char*)data, size);
-    return true;
+    return (bool)f;
 }
 
 static void DumpRegion(uintptr_t base, size_t size, const fs::path& folder, const char* prefix) {
+    if (size == 0 || size > 0x10000000) return; // sanity
     std::vector<BYTE> buf(size);
     SIZE_T read = 0;
     if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)base, buf.data(), size, &read) || read == 0)
@@ -63,40 +66,39 @@ static void PerformDump(uintptr_t faultAddr) {
     // 1. region dump
     DumpRegion(regionBase, regionSize, regionDir, "region_dump");
 
-    // 2. KUSER_SHARED_DATA (fixed 0x7FFE0000)
+    // 2. KUSER_SHARED_DATA (fixed 0x7FFE0000 on x64)
     DumpRegion(0x7FFE0000, 0x1000, regionDir, "kuser_dump");
 
     // 3. PEB
-    auto teb = (PTEB)NtCurrentTeb();
+    auto teb = NtCurrentTeb();
     if (teb && teb->ProcessEnvironmentBlock) {
         DumpRegion((uintptr_t)teb->ProcessEnvironmentBlock, 0x1000, regionDir, "peb_dump");
     }
 
-    // 4. TEB of current thread (the one that hit DllMain)
+    // 4. TEB of current thread (the one that hit the guarded page / DllMain)
     DumpRegion((uintptr_t)teb, 0x2000, regionDir, "teb_dump");
 
-    // One-time full_cpuid_dump (main module image + kuser for "cpuid" context)
+    // One-time full_cpuid_dump (main module image)
     if (!g_FullDumped) {
         std::lock_guard<std::mutex> lock(g_DumpMtx);
         if (!g_FullDumped) {
             g_FullDumped = true;
-            // Find main module (cs2.exe)
             HMODULE hMain = GetModuleHandleW(nullptr);
             if (hMain) {
                 MODULEINFO mi{};
                 if (GetModuleInformation(GetCurrentProcess(), hMain, &mi, sizeof(mi))) {
                     std::vector<BYTE> full(mi.SizeOfImage);
                     SIZE_T rd = 0;
-                    ReadProcessMemory(GetCurrentProcess(), mi.lpBaseOfDll, full.data(), mi.SizeOfImage, &rd);
-                    WriteBin(fs::path(g_DumpRoot) / "full_cpuid_dump.bin", full.data(), rd);
+                    if (ReadProcessMemory(GetCurrentProcess(), mi.lpBaseOfDll, full.data(), mi.SizeOfImage, &rd) && rd) {
+                        WriteBin(fs::path(g_DumpRoot) / "full_cpuid_dump.bin", full.data(), rd);
+                    }
                 }
             }
         }
     }
 
-    // Optional: OutputDebugString for external monitors
     char msg[256];
-    sprintf_s(msg, "[VEH] Dumped region 0x%llX size 0x%zX\n", regionBase, regionSize);
+    sprintf_s(msg, "[VEH] Dumped region 0x%llX size 0x%zX\n", (unsigned long long)regionBase, regionSize);
     OutputDebugStringA(msg);
 }
 
@@ -105,15 +107,14 @@ LONG CALLBACK VehHandler(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_SEARCH;
 
     PVOID fault = ep->ExceptionRecord->ExceptionAddress;
-    // Only care about execute faults on our guarded pages
     PerformDump((uintptr_t)fault);
 
-    // Continue execution. PAGE_GUARD is one-shot; the page is now executable without guard.
-    // We intentionally do NOT re-arm here so each region dumps only once (fast + concurrent safe).
+    // PAGE_GUARD is one-shot. We leave it removed so the real DllMain continues normally.
+    // Dump-once per region base keeps it fast under concurrent loads.
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-// Arm PAGE_GUARD on the entry point page of every loaded module
+// Arm PAGE_GUARD on the entry-point page of every currently loaded module
 static void ArmGuards() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) return;
@@ -121,7 +122,6 @@ static void ArmGuards() {
     MODULEENTRY32W me{ sizeof(me) };
     if (Module32FirstW(snap, &me)) {
         do {
-            // Skip our own mapped image if possible (optional)
             BYTE* base = me.modBaseAddr;
             auto dos = (IMAGE_DOS_HEADER*)base;
             if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
@@ -132,25 +132,24 @@ static void ArmGuards() {
             if (!epRva) continue;
             BYTE* ep = base + epRva;
 
-            // Protect the page containing the entry point
             MEMORY_BASIC_INFORMATION mbi{};
             if (VirtualQuery(ep, &mbi, sizeof(mbi))) {
                 DWORD old = 0;
-                // Keep existing protect + add GUARD
-                DWORD newProt = (mbi.Protect & 0xFF) | PAGE_GUARD;
-                // If it was PAGE_EXECUTE_READ etc, preserve
-                if (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+                // Preserve current protection bits and add PAGE_GUARD
+                DWORD prot = mbi.Protect;
+                if (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
+                    DWORD newProt = (prot & ~(PAGE_GUARD | PAGE_NOACCESS)) | PAGE_GUARD;
                     VirtualProtect(mbi.BaseAddress, mbi.RegionSize, newProt, &old);
+                }
             }
         } while (Module32NextW(snap, &me));
     }
     CloseHandle(snap);
 }
 
-// Also arm future modules by hooking LdrLoadDll would be ideal, but for PoC we re-arm periodically or on first hits.
-// Simple: spawn a background thread that re-scans every 50ms for a short time after attach.
+// Background re-arm for modules that load after our injection (common for game DLLs)
 static DWORD WINAPI GuardArmThread(LPVOID) {
-    for (int i = 0; i < 200; ++i) { // ~10 seconds of aggressive re-arm
+    for (int i = 0; i < 300; ++i) { // ~15 s of aggressive coverage
         ArmGuards();
         Sleep(50);
     }
@@ -161,24 +160,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
 
-        // Ensure dump root is usable (if marker not patched, fall back)
+        // If host did not patch the marker, fall back to %TEMP%\cs2.exe_dumps
         if (strncmp(g_DumpRoot, "DUMPROOT_PLACEHOLDER", 20) == 0) {
-            // Fallback to temp
             GetTempPathA(MAX_PATH, g_DumpRoot);
             strcat_s(g_DumpRoot, "cs2.exe_dumps");
         }
-        fs::create_directories(g_DumpRoot);
+        std::error_code ec;
+        fs::create_directories(g_DumpRoot, ec);
 
-        g_VehHandle = AddVectoredExceptionHandler(1, VehHandler); // first handler
+        g_VehHandle = AddVectoredExceptionHandler(1, VehHandler);
         if (!g_VehHandle) return FALSE;
 
         ArmGuards();
-        CreateThread(nullptr, 0, GuardArmThread, nullptr, 0, nullptr);
+        HANDLE h = CreateThread(nullptr, 0, GuardArmThread, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
 
         OutputDebugStringA("[veh_dumper] VEH registered + PAGE_GUARD armed on entry points\n");
     }
     else if (reason == DLL_PROCESS_DETACH) {
-        if (g_VehHandle) RemoveVectoredExceptionHandler(g_VehHandle);
+        if (g_VehHandle) {
+            RemoveVectoredExceptionHandler(g_VehHandle);
+            g_VehHandle = nullptr;
+        }
     }
     return TRUE;
 }
