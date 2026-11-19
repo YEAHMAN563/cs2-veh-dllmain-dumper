@@ -1,6 +1,7 @@
 #include "manual_map.h"
 #include <iostream>
 #include <fstream>
+#include <cstring>
 
 // PE helpers
 static IMAGE_NT_HEADERS64* GetNtHeaders(BYTE* base) {
@@ -31,8 +32,9 @@ bool ReadFileToBuffer(const std::wstring& path, std::vector<BYTE>& out) {
     return true;
 }
 
-// Very simplified manual map focused on functionality for this dumper.
-// Full production mapper would handle TLS, SEH, delayed imports etc. more carefully.
+// Manual map with stealth features:
+// - Never inserts into PEB LDR lists → appears as anonymous executable memory (no module name)
+// - PE headers wiped after DllMain so MZ/PE signature scanners find nothing
 PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char* dumpRootPath) {
     if (dllData.empty()) return nullptr;
     BYTE* local = (BYTE*)dllData.data();
@@ -43,14 +45,18 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
     }
 
     SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
-    PVOID remoteBase = VirtualAllocEx(hProcess, nullptr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    SIZE_T headersSize = nt->OptionalHeader.SizeOfHeaders;
+
+    // Allocate as RWX for simplicity (can be tightened later)
+    PVOID remoteBase = VirtualAllocEx(hProcess, nullptr, imageSize,
+                                      MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!remoteBase) {
         std::cout << "[!] VirtualAllocEx failed: " << GetLastError() << "\n";
         return nullptr;
     }
 
     // Copy headers
-    if (!WriteProcessMemory(hProcess, remoteBase, local, nt->OptionalHeader.SizeOfHeaders, nullptr)) {
+    if (!WriteProcessMemory(hProcess, remoteBase, local, headersSize, nullptr)) {
         VirtualFreeEx(hProcess, remoteBase, 0, MEM_RELEASE);
         return nullptr;
     }
@@ -60,7 +66,7 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
         if (sec->SizeOfRawData == 0) continue;
         void* dest = (BYTE*)remoteBase + sec->VirtualAddress;
-        void* src = local + sec->PointerToRawData;
+        void* src  = local + sec->PointerToRawData;
         if (!WriteProcessMemory(hProcess, dest, src, sec->SizeOfRawData, nullptr)) {
             VirtualFreeEx(hProcess, remoteBase, 0, MEM_RELEASE);
             return nullptr;
@@ -88,15 +94,16 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
         }
     }
 
-    // Imports (basic)
+    // Imports
     auto& impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (impDir.Size) {
         auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(local + RvaToOffset(local, impDir.VirtualAddress));
         while (imp->Name) {
             char* modName = (char*)(local + RvaToOffset(local, imp->Name));
-            HMODULE hMod = LoadLibraryA(modName); // local resolve, then write remote addresses
+            HMODULE hMod = LoadLibraryA(modName);
             if (!hMod) { ++imp; continue; }
-            auto thunk = (IMAGE_THUNK_DATA64*)(local + RvaToOffset(local, imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+            auto thunk = (IMAGE_THUNK_DATA64*)(local + RvaToOffset(local,
+                imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
             auto iat = (IMAGE_THUNK_DATA64*)((BYTE*)remoteBase + imp->FirstThunk);
             for (; thunk->u1.AddressOfData; ++thunk, ++iat) {
                 FARPROC fn = nullptr;
@@ -115,22 +122,12 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
         }
     }
 
-    // Patch dump root path into the image.
-    // We look for the marker string "DUMPROOT_PLACEHOLDER_XXXX" that the DLL contains and overwrite it.
+    // Patch dump root path (marker search)
     const char* marker = "DUMPROOT_PLACEHOLDER_XXXX";
     size_t markerLen = strlen(marker);
-    // Search in local image for the marker (it is in .data)
     for (size_t i = 0; i + markerLen < dllData.size(); ++i) {
         if (memcmp(local + i, marker, markerLen) == 0) {
-            // Compute remote address of this location
-            // Approximate: headers + section containing it. For simplicity write the path at the remote equivalent offset.
-            // Better: find which section, but since we copied raw, the file offset maps approximately for small images.
-            // We will write the full path over the marker in the remote image at the same RVA if possible.
-            // Simple approach: search remote after copy? But easier to calculate RVA of the string.
-            // For this PoC we write at the file offset mapped to remote if it falls in a section.
-            // Actual robust way: the DLL exports or has a known global; here we overwrite the marker bytes in remote.
             DWORD rvaOfMarker = 0;
-            // Find RVA by scanning sections
             auto sec2 = IMAGE_FIRST_SECTION(nt);
             for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec2) {
                 if (i >= sec2->PointerToRawData && i < sec2->PointerToRawData + sec2->SizeOfRawData) {
@@ -142,24 +139,38 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
                 char pathBuf[MAX_PATH] = {};
                 strncpy_s(pathBuf, dumpRootPath, MAX_PATH - 1);
                 WriteProcessMemory(hProcess, (BYTE*)remoteBase + rvaOfMarker, pathBuf, MAX_PATH, nullptr);
-                std::cout << "[*] Patched dump root into mapped image at RVA 0x" << std::hex << rvaOfMarker << std::dec << "\n";
             }
             break;
         }
     }
 
-    // Call DllMain remotely via shellcode or CreateRemoteThread on the entry.
-    // Simple CreateRemoteThread on AddressOfEntryPoint (works for many cases; TLS may be incomplete).
+    // Call DllMain
     uintptr_t entry = (uintptr_t)remoteBase + nt->OptionalHeader.AddressOfEntryPoint;
-    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)entry, remoteBase, 0, nullptr);
-    if (!hThread) {
+    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0,
+                                        (LPTHREAD_START_ROUTINE)entry, remoteBase, 0, nullptr);
+    if (hThread) {
+        WaitForSingleObject(hThread, 8000);
+        CloseHandle(hThread);
+    } else {
         std::cout << "[!] CreateRemoteThread failed: " << GetLastError() << "\n";
-        // still return base, user can call later
-        return remoteBase;
     }
-    WaitForSingleObject(hThread, 5000);
-    CloseHandle(hThread);
 
-    std::cout << "[+] Manual map complete, remote base = 0x" << std::hex << (uintptr_t)remoteBase << std::dec << "\n";
+    // ========== STEALTH: wipe PE headers ==========
+    // After DllMain has run we no longer need the headers.
+    // Zeroing them removes MZ/PE signatures from the image base.
+    std::vector<BYTE> zero(headersSize, 0);
+    if (WriteProcessMemory(hProcess, remoteBase, zero.data(), headersSize, nullptr)) {
+        std::cout << "[+] PE headers wiped (" << headersSize << " bytes)\n";
+    }
+
+    // Optional: make the header page non-readable so casual scanners get ACCESS_DENIED
+    DWORD oldProt = 0;
+    VirtualProtectEx(hProcess, remoteBase, headersSize, PAGE_NOACCESS, &oldProt);
+
+    // Note: we deliberately never call any Ldr* function that would insert
+    // this image into the PEB LDR lists. Result = nameless / invisible module.
+
+    std::cout << "[+] Manual map complete (stealth), remote base = 0x"
+              << std::hex << (uintptr_t)remoteBase << std::dec << "\n";
     return remoteBase;
 }
