@@ -1,0 +1,6 @@
+# Ignore all build artifacts ...
+build/
+
+# ... except the Release binaries
+!build/Release/dumper.exe
+!build/Release/veh_dumper.dll

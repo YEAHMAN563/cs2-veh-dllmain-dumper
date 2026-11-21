@@ -12,14 +12,17 @@ static IMAGE_NT_HEADERS64* GetNtHeaders(BYTE* base) {
     return nt;
 }
 
-static uintptr_t RvaToOffset(BYTE* base, DWORD rva) {
+static BYTE* RvaToPointer(BYTE* base, DWORD rva) {
+    if (!rva) return nullptr;
     auto nt = GetNtHeaders(base);
+    if (!nt) return nullptr;
     auto sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        if (rva >= sec->VirtualAddress && rva < sec->VirtualAddress + sec->Misc.VirtualSize)
-            return (uintptr_t)(base + sec->PointerToRawData + (rva - sec->VirtualAddress));
+        DWORD secSize = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        if (rva >= sec->VirtualAddress && rva < sec->VirtualAddress + secSize)
+            return base + sec->PointerToRawData + (rva - sec->VirtualAddress);
     }
-    return 0;
+    return nullptr;
 }
 
 bool ReadFileToBuffer(const std::wstring& path, std::vector<BYTE>& out) {
@@ -32,9 +35,6 @@ bool ReadFileToBuffer(const std::wstring& path, std::vector<BYTE>& out) {
     return true;
 }
 
-// Manual map with stealth features:
-// - Never inserts into PEB LDR lists → appears as anonymous executable memory (no module name)
-// - PE headers wiped after DllMain so MZ/PE signature scanners find nothing
 PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char* dumpRootPath) {
     if (dllData.empty()) return nullptr;
     BYTE* local = (BYTE*)dllData.data();
@@ -47,7 +47,7 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
     SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
     SIZE_T headersSize = nt->OptionalHeader.SizeOfHeaders;
 
-    // Allocate as RWX for simplicity (can be tightened later)
+    // Allocate as RWX for mapped image
     PVOID remoteBase = VirtualAllocEx(hProcess, nullptr, imageSize,
                                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!remoteBase) {
@@ -55,7 +55,7 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
         return nullptr;
     }
 
-    // Copy headers
+    // Copy headers (intact)
     if (!WriteProcessMemory(hProcess, remoteBase, local, headersSize, nullptr)) {
         VirtualFreeEx(hProcess, remoteBase, 0, MEM_RELEASE);
         return nullptr;
@@ -76,49 +76,59 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
     // Relocations
     auto& relocDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (relocDir.Size) {
-        auto reloc = (IMAGE_BASE_RELOCATION*)(local + RvaToOffset(local, relocDir.VirtualAddress));
-        uintptr_t delta = (uintptr_t)remoteBase - nt->OptionalHeader.ImageBase;
-        while (reloc->VirtualAddress) {
-            DWORD num = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* list = (WORD*)(reloc + 1);
-            for (DWORD i = 0; i < num; ++i) {
-                if ((list[i] >> 12) == IMAGE_REL_BASED_DIR64) {
-                    uintptr_t* p = (uintptr_t*)((BYTE*)remoteBase + reloc->VirtualAddress + (list[i] & 0xFFF));
-                    uintptr_t val = 0;
-                    ReadProcessMemory(hProcess, p, &val, sizeof(val), nullptr);
-                    val += delta;
-                    WriteProcessMemory(hProcess, p, &val, sizeof(val), nullptr);
+        auto reloc = (IMAGE_BASE_RELOCATION*)RvaToPointer(local, relocDir.VirtualAddress);
+        if (reloc) {
+            uintptr_t delta = (uintptr_t)remoteBase - nt->OptionalHeader.ImageBase;
+            auto relocEnd = (BYTE*)reloc + relocDir.Size;
+            while ((BYTE*)reloc < relocEnd && reloc->VirtualAddress && reloc->SizeOfBlock) {
+                DWORD num = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+                WORD* list = (WORD*)(reloc + 1);
+                for (DWORD i = 0; i < num; ++i) {
+                    if ((list[i] >> 12) == IMAGE_REL_BASED_DIR64) {
+                        uintptr_t* p = (uintptr_t*)((BYTE*)remoteBase + reloc->VirtualAddress + (list[i] & 0xFFF));
+                        uintptr_t val = 0;
+                        ReadProcessMemory(hProcess, p, &val, sizeof(val), nullptr);
+                        val += delta;
+                        WriteProcessMemory(hProcess, p, &val, sizeof(val), nullptr);
+                    }
                 }
+                reloc = (IMAGE_BASE_RELOCATION*)((BYTE*)reloc + reloc->SizeOfBlock);
             }
-            reloc = (IMAGE_BASE_RELOCATION*)((BYTE*)reloc + reloc->SizeOfBlock);
         }
     }
 
     // Imports
     auto& impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (impDir.Size) {
-        auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(local + RvaToOffset(local, impDir.VirtualAddress));
-        while (imp->Name) {
-            char* modName = (char*)(local + RvaToOffset(local, imp->Name));
-            HMODULE hMod = LoadLibraryA(modName);
-            if (!hMod) { ++imp; continue; }
-            auto thunk = (IMAGE_THUNK_DATA64*)(local + RvaToOffset(local,
-                imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-            auto iat = (IMAGE_THUNK_DATA64*)((BYTE*)remoteBase + imp->FirstThunk);
-            for (; thunk->u1.AddressOfData; ++thunk, ++iat) {
-                FARPROC fn = nullptr;
-                if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
-                    fn = GetProcAddress(hMod, (LPCSTR)(thunk->u1.Ordinal & 0xFFFF));
-                } else {
-                    auto ibn = (IMAGE_IMPORT_BY_NAME*)(local + RvaToOffset(local, (DWORD)thunk->u1.AddressOfData));
-                    fn = GetProcAddress(hMod, ibn->Name);
+        auto imp = (IMAGE_IMPORT_DESCRIPTOR*)RvaToPointer(local, impDir.VirtualAddress);
+        if (imp) {
+            while (imp->Name) {
+                char* modName = (char*)RvaToPointer(local, imp->Name);
+                if (!modName) { ++imp; continue; }
+                HMODULE hMod = LoadLibraryA(modName);
+                if (!hMod) { ++imp; continue; }
+                DWORD thunkRva = imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk;
+                auto thunk = (IMAGE_THUNK_DATA64*)RvaToPointer(local, thunkRva);
+                auto iat = (IMAGE_THUNK_DATA64*)((BYTE*)remoteBase + imp->FirstThunk);
+                if (thunk && iat) {
+                    for (; thunk->u1.AddressOfData; ++thunk, ++iat) {
+                        FARPROC fn = nullptr;
+                        if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
+                            fn = GetProcAddress(hMod, (LPCSTR)(thunk->u1.Ordinal & 0xFFFF));
+                        } else {
+                            auto ibn = (IMAGE_IMPORT_BY_NAME*)RvaToPointer(local, (DWORD)thunk->u1.AddressOfData);
+                            if (ibn) {
+                                fn = GetProcAddress(hMod, ibn->Name);
+                            }
+                        }
+                        if (fn) {
+                            uintptr_t addr = (uintptr_t)fn;
+                            WriteProcessMemory(hProcess, &iat->u1.Function, &addr, sizeof(addr), nullptr);
+                        }
+                    }
                 }
-                if (fn) {
-                    uintptr_t addr = (uintptr_t)fn;
-                    WriteProcessMemory(hProcess, &iat->u1.Function, &addr, sizeof(addr), nullptr);
-                }
+                ++imp;
             }
-            ++imp;
         }
     }
 
@@ -144,33 +154,62 @@ PVOID ManualMapDll(HANDLE hProcess, const std::vector<BYTE>& dllData, const char
         }
     }
 
-    // Call DllMain
+    // Call DllMain via a small x64 stub that properly sets:
+    // RCX = remoteBase (hinstDLL)
+    // RDX = DLL_PROCESS_ATTACH (1)
+    // R8  = NULL (lpReserved)
+    // This ensures _DllMainCRTStartup runs CRT initialization (_CRT_INIT),
+    // invokes C++ static constructors, and safely executes DllMain.
     uintptr_t entry = (uintptr_t)remoteBase + nt->OptionalHeader.AddressOfEntryPoint;
+
+    BYTE stub[] = {
+        0x48, 0x83, 0xEC, 0x28,                         // sub rsp, 28h
+        0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0,             // mov rcx, remoteBase
+        0xBA, 0x01, 0x00, 0x00, 0x00,                   // mov edx, 1 (DLL_PROCESS_ATTACH)
+        0x45, 0x31, 0xC0,                               // xor r8d, r8d (lpReserved = NULL)
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,             // mov rax, entry
+        0xFF, 0xD0,                                     // call rax
+        0x48, 0x83, 0xC4, 0x28,                         // add rsp, 28h
+        0xC3                                            // ret
+    };
+    *reinterpret_cast<uintptr_t*>(&stub[6])  = reinterpret_cast<uintptr_t>(remoteBase);
+    *reinterpret_cast<uintptr_t*>(&stub[24]) = entry;
+
+    PVOID pStub = VirtualAllocEx(hProcess, nullptr, sizeof(stub),
+                                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pStub) {
+        std::cout << "[!] VirtualAllocEx for stub failed: " << GetLastError() << "\n";
+        VirtualFreeEx(hProcess, remoteBase, 0, MEM_RELEASE);
+        return nullptr;
+    }
+
+    if (!WriteProcessMemory(hProcess, pStub, stub, sizeof(stub), nullptr)) {
+        std::cout << "[!] WriteProcessMemory for stub failed: " << GetLastError() << "\n";
+        VirtualFreeEx(hProcess, pStub, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, remoteBase, 0, MEM_RELEASE);
+        return nullptr;
+    }
+
     HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0,
-                                        (LPTHREAD_START_ROUTINE)entry, remoteBase, 0, nullptr);
+                                        (LPTHREAD_START_ROUTINE)pStub, nullptr, 0, nullptr);
     if (hThread) {
         WaitForSingleObject(hThread, 8000);
+        DWORD exitCode = 0;
+        GetExitCodeThread(hThread, &exitCode);
         CloseHandle(hThread);
+        std::cout << "[+] Remote DllMain thread exited with code " << exitCode << "\n";
     } else {
         std::cout << "[!] CreateRemoteThread failed: " << GetLastError() << "\n";
+        VirtualFreeEx(hProcess, pStub, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, remoteBase, 0, MEM_RELEASE);
+        return nullptr;
     }
 
-    // ========== STEALTH: wipe PE headers ==========
-    // After DllMain has run we no longer need the headers.
-    // Zeroing them removes MZ/PE signatures from the image base.
-    std::vector<BYTE> zero(headersSize, 0);
-    if (WriteProcessMemory(hProcess, remoteBase, zero.data(), headersSize, nullptr)) {
-        std::cout << "[+] PE headers wiped (" << headersSize << " bytes)\n";
-    }
+    // Clean up stub
+    VirtualFreeEx(hProcess, pStub, 0, MEM_RELEASE);
 
-    // Optional: make the header page non-readable so casual scanners get ACCESS_DENIED
-    DWORD oldProt = 0;
-    VirtualProtectEx(hProcess, remoteBase, headersSize, PAGE_NOACCESS, &oldProt);
-
-    // Note: we deliberately never call any Ldr* function that would insert
-    // this image into the PEB LDR lists. Result = nameless / invisible module.
-
-    std::cout << "[+] Manual map complete (stealth), remote base = 0x"
+    // Keep PE headers completely intact for stability and standard unwinding
+    std::cout << "[+] Manual map complete (safe, headers intact), remote base = 0x"
               << std::hex << (uintptr_t)remoteBase << std::dec << "\n";
     return remoteBase;
 }

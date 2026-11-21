@@ -23,12 +23,14 @@ enum class Color : WORD {
 };
 
 static HANDLE g_hCon = nullptr;
+static std::mutex g_PrintMtx;
 
 static void SetColor(Color c) {
     if (g_hCon) SetConsoleTextAttribute(g_hCon, static_cast<WORD>(c));
 }
 
 static void Print(Color c, const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_PrintMtx);
     SetColor(c);
     std::cout << msg << std::flush;
     SetColor(Color::Default);
@@ -166,79 +168,90 @@ void WatchDumpsFolder(const fs::path& root) {
 }
 
 int main() {
-    AllocConsole();
-    freopen_s(reinterpret_cast<FILE**>(stdout), "CONOUT$", "w", stdout);
-    freopen_s(reinterpret_cast<FILE**>(stderr), "CONOUT$", "w", stderr);
-    freopen_s(reinterpret_cast<FILE**>(stdin),  "CONIN$",  "r", stdin);
-    SetConsoleTitleW(L"CS2 VEH DllMain Dumper - cyberhange");
+    try {
+        g_hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleTitleW(L"CS2 VEH DllMain Dumper - cyberhange");
 
-    g_hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+        Print(Color::Cyan, "=============================================\n");
+        Print(Color::Cyan, " CS2 VEH DllMain Region Dumper (cyberhange)\n");
+        Print(Color::Cyan, "=============================================\n\n");
 
-    Print(Color::Cyan, "=============================================\n");
-    Print(Color::Cyan, " CS2 VEH DllMain Region Dumper (cyberhange)\n");
-    Print(Color::Cyan, "=============================================\n\n");
-
-    if (!IsElevated()) {
-        Print(Color::Red, "[!] Not running as admin. Relaunch elevated.\n");
-        system("pause");
-        return 1;
-    }
-    Print(Color::Green, "[+] Running elevated\n");
-    EnableDebugPriv();
-
-    auto exeDir = GetExeDir();
-    fs::path dumpRoot = fs::path(exeDir) / "cs2.exe_dumps";
-    std::error_code ec;
-    fs::create_directories(dumpRoot, ec);
-    if (ec) {
-        Print(Color::Red, "[!] Failed to create dump root: " + ec.message() + "\n");
-        system("pause");
-        return 1;
-    }
-    Print(Color::Green, "[+] Dump root: " + dumpRoot.string() + "\n");
-
-    std::thread watcher(WatchDumpsFolder, dumpRoot);
-    watcher.detach();
-
-    fs::path dllPath = fs::path(exeDir) / "veh_dumper.dll";
-    if (!fs::exists(dllPath)) {
-        Print(Color::Red, "[!] veh_dumper.dll not found next to exe\n");
-        system("pause");
-        return 1;
-    }
-
-    std::vector<BYTE> dllBuf;
-    if (!ReadFileToBuffer(dllPath.wstring(), dllBuf)) {
-        Print(Color::Red, "[!] Failed to read DLL\n");
-        return 1;
-    }
-    Print(Color::Green, "[+] Loaded veh_dumper.dll (" + std::to_string(dllBuf.size()) + " bytes)\n");
-
-    Print(Color::Yellow, "[*] Watching for cs2.exe ...\n");
-
-    DWORD lastPid = 0;
-    while (true) {
-        DWORD pid = FindProcessId(L"cs2.exe");
-        if (pid && pid != lastPid) {
-            lastPid = pid;
-            Print(Color::Green, "[+] Found cs2.exe PID " + std::to_string(pid) + " - injecting\n");
-
-            HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-            if (!hProc) {
-                Print(Color::Red, "[!] OpenProcess failed: " + std::to_string(GetLastError()) + "\n");
-                continue;
-            }
-
-            std::string dumpRootA = dumpRoot.string();
-            PVOID base = ManualMapDll(hProc, dllBuf, dumpRootA.c_str());
-            if (base) {
-                Print(Color::Green, "[+] Injected. VEH armed. Waiting for DllMain hits...\n");
-            } else {
-                Print(Color::Red, "[!] Manual map failed\n");
-            }
-            CloseHandle(hProc);
+        if (!IsElevated()) {
+            Print(Color::Red, "[!] Error: dumper.exe requires Administrator privileges.\n");
+            Print(Color::Yellow, "[*] Please open cmd as Administrator and run dumper.exe again.\n");
+            return 1;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        Print(Color::Green, "[+] Running elevated\n");
+        EnableDebugPriv();
+
+        auto exeDir = GetExeDir();
+        fs::path dumpRoot = fs::path(exeDir) / "cs2.exe_dumps";
+        std::error_code ec;
+        fs::create_directories(dumpRoot, ec);
+        if (ec) {
+            Print(Color::Red, "[!] Failed to create dump root: " + ec.message() + "\n");
+            return 1;
+        }
+        Print(Color::Green, "[+] Dump root: " + dumpRoot.string() + "\n");
+
+        std::thread watcher(WatchDumpsFolder, dumpRoot);
+        watcher.detach();
+
+        fs::path dllPath = fs::path(exeDir) / "veh_dumper.dll";
+        if (!fs::exists(dllPath)) {
+            Print(Color::Red, "[!] veh_dumper.dll not found next to exe: " + dllPath.string() + "\n");
+            return 1;
+        }
+
+        std::vector<BYTE> dllBuf;
+        if (!ReadFileToBuffer(dllPath.wstring(), dllBuf)) {
+            Print(Color::Red, "[!] Failed to read DLL: " + dllPath.string() + "\n");
+            return 1;
+        }
+        Print(Color::Green, "[+] Loaded veh_dumper.dll (" + std::to_string(dllBuf.size()) + " bytes)\n");
+
+        Print(Color::Yellow, "[*] Watchdog active. Waiting for cs2.exe ...\n");
+
+        DWORD injectedPid = 0;
+        while (true) {
+            DWORD pid = FindProcessId(L"cs2.exe");
+            if (pid == 0) {
+                if (injectedPid != 0) {
+                    Print(Color::Yellow, "[-] cs2.exe (PID " + std::to_string(injectedPid) + ") exited. Watching for next instance...\n");
+                    injectedPid = 0;
+                }
+            } else if (pid != injectedPid) {
+                Print(Color::Green, "[+] Found cs2.exe PID " + std::to_string(pid) + " - injecting\n");
+
+                HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+                if (!hProc) {
+                    Print(Color::Red, "[!] OpenProcess failed: " + std::to_string(GetLastError()) + " (retrying in 500ms)...\n");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    continue;
+                }
+
+                std::string dumpRootA = dumpRoot.string();
+                PVOID base = ManualMapDll(hProc, dllBuf, dumpRootA.c_str());
+                CloseHandle(hProc);
+
+                if (base) {
+                    injectedPid = pid;
+                    Print(Color::Green, "[+] Injected into PID " + std::to_string(pid) + ". VEH armed. Watching for DllMain hits...\n");
+                } else {
+                    Print(Color::Red, "[!] Manual map failed into PID " + std::to_string(pid) + " (retrying in 500ms)...\n");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    }
+    catch (const std::exception& ex) {
+        Print(Color::Red, std::string("[FATAL EXCEPTION] ") + ex.what() + "\n");
+        return 1;
+    }
+    catch (...) {
+        Print(Color::Red, "[FATAL EXCEPTION] Unknown exception occurred\n");
+        return 1;
     }
     return 0;
 }

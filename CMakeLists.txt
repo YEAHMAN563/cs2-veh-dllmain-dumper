@@ -12,8 +12,7 @@ add_executable(dumper
 target_include_directories(dumper PRIVATE src/dumper)
 if(MSVC)
     target_compile_options(dumper PRIVATE /W3 /EHsc /MT)
-    # Admin manifest via linker flag
-    set_target_properties(dumper PROPERTIES LINK_FLAGS "/MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
+    target_link_options(dumper PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
 endif()
 
 # Payload DLL
